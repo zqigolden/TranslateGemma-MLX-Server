@@ -1,0 +1,25 @@
+model_path: mlx-community/translategemma-4b-it-4bit
+max_context_tokens: 2048
+default_max_output_tokens: 512
+min_input_budget: 256
+extra_stop_strings:
+  - "<end_of_turn>"
+src_language_code: null
+dst_language_code: null
+lang_alias:
+  zh:
+    - simplified chinese
+    - chinese
+    - 简体中文
+  zh-TW:
+    - traditional chinese
+    - 繁體中文
+  ja:
+    - japanese
+    - 日本語
+  en:
+    - english
+  ko:
+    - korean
+    - 한국어
+verbose_logging: false
