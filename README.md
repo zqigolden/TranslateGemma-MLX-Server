@@ -65,7 +65,7 @@ uvicorn server:app --host 127.0.0.1 --port 8088
 - Edit `config.yaml` to change defaults such as the model map, context limits, or default languages.
 - Use `model_map` to map user-facing model names to local MLX paths.
 - Use `model_idle_timeout_seconds` to control when inactive models are unloaded.
-- Use `lang_alias` in `config.yaml` to map a canonical language code to a list of human-readable aliases (for example `zh: ["simplified chinese", "chinese"]`).
+- Use `lang_alias` in `config.yaml` to translate tool-specific language labels into canonical ISO 639-1 codes (for example `zh: ["simplified chinese", "chinese"]`).
 - Use `TRANSLATEGEMMA_CONFIG_FILE=/path/to/custom.yaml` when launching `uvicorn` if you want to point the server at another YAML file.
 - Environment variables continue to take precedence over YAML values, so automation scripts and `start_*.sh` remain compatible.
 
