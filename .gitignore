@@ -30,3 +30,4 @@ env/
 start_*.sh
 config.*.yaml
 AGENTS.md
+try.py

@@ -13,11 +13,12 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 class TranslateGemmaConfig(BaseModel):
-    model_path: str = "mlx-community/translategemma-4b-it-4bit"
+    model_map: Dict[str, str] = Field(default_factory=dict)
     max_context_tokens: int = 2048
     default_max_output_tokens: int = 512
     min_input_budget: int = 256
     extra_stop_strings: Tuple[str, ...] = Field(default_factory=lambda: ("<end_of_turn>",))
+    model_idle_timeout_seconds: int = 600
     src_language_code: Optional[str] = None
     dst_language_code: Optional[str] = None
     lang_alias: Dict[str, List[str]] = Field(default_factory=dict)
@@ -30,6 +31,25 @@ class TranslateGemmaConfig(BaseModel):
         if isinstance(value, (list, tuple)):
             return tuple(str(item) for item in value if str(item))
         return (str(value),)
+
+    @validator("model_map", pre=True)
+    def _normalize_model_map(cls, value: Any) -> Dict[str, str]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("model_map must be a mapping of model names to paths.")
+        normalized: Dict[str, str] = {}
+        for key, path in value.items():
+            name = " ".join(str(key).strip().split())
+            if not name:
+                continue
+            if path is None:
+                continue
+            path_value = str(path).strip()
+            if not path_value:
+                continue
+            normalized[name] = path_value
+        return normalized
 
     @validator("src_language_code", "dst_language_code", pre=True)
     def _normalize_lang(cls, value: Optional[str]) -> Optional[str]:
@@ -102,8 +122,14 @@ def _strip_language_suffix(value: str) -> str:
     return value
 
 
+def _finalize_model_config(config: TranslateGemmaConfig) -> TranslateGemmaConfig:
+    if not config.model_map:
+        raise ValueError("model_map must not be empty.")
+    return config
+
+
 _ENV_OVERRIDE_MAP = {
-    "TRANSLATEGEMMA_MLX_MODEL": ("model_path", str),
+    "TRANSLATEGEMMA_MODEL_IDLE_TIMEOUT": ("model_idle_timeout_seconds", int),
     "MAX_CONTEXT_TOKENS": ("max_context_tokens", int),
     "DEFAULT_MAX_OUTPUT_TOKENS": ("default_max_output_tokens", int),
     "MIN_INPUT_BUDGET": ("min_input_budget", int),
@@ -138,4 +164,4 @@ def load_config() -> TranslateGemmaConfig:
     if overrides:
         config = config.copy(update=overrides)
 
-    return config
+    return _finalize_model_config(config)

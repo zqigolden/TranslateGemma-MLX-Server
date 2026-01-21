@@ -15,10 +15,13 @@ pip install mlx-lm fastapi uvicorn pydantic openai
 
 ## server.py
 
-- Loads the TranslateGemma weights into MLX once at startup (`config.yaml` provides the defaults; environment variables still override them).
+- Loads TranslateGemma weights on demand per request based on the requested model name (from `config.yaml`).
+- Unloads the active model when a different model is requested or after a period of inactivity.
 - Provides `/health` and `/v1/chat/completions` endpoints that mirror the OpenAI Chat Completions API.
+- Provides `/v1/models` and `/v1/models/{model_id}` for model discovery.
 - Automatically chunks long texts, detects Chinese vs. non-Chinese content, and uses `mlx_lm` samplers for deterministic or temperature-driven decoding.
 - Adds `<end_of_turn>` as an EOS token so generations stop before returning that marker.
+- Select the active model by passing `model` in the request body (required; must match a key in `model_map`).
 - Accepts optional `src_language_code` / `dst_language_code` request fields (omit both to rely on config defaults) or inline directives like `[zh]->[en]` to override language detection.
 - Honors the `TRANSLATEGEMMA_VERBOSE` environment variable so you can enable/disable chunk debug logs and `mlx_lm.generate(..., verbose=True)` without changing API requests.
 - Reads configuration defaults from `config.yaml` via `config.py` (PyYAML + Pydantic); environment variables can override individual values.
@@ -28,7 +31,7 @@ pip install mlx-lm fastapi uvicorn pydantic openai
 
 | Env Var | Default | Description |
 | --- | --- | --- |
-| `TRANSLATEGEMMA_MLX_MODEL` | `mlx-community/translategemma-4b-it-4bit` | Path to the MLX TranslateGemma model. |
+| `TRANSLATEGEMMA_MODEL_IDLE_TIMEOUT` | `600` | Seconds of idle time before the loaded model is unloaded. |
 | `MAX_CONTEXT_TOKENS` | `2048` | Total context budget (prompt + output). |
 | `DEFAULT_MAX_OUTPUT_TOKENS` | `512` | Fallback `max_tokens` value when API clients omit it. |
 | `SRC_LANGUAGE_CODE` | unset | Optional explicit source language code used when no higher-priority input is provided. |
@@ -39,7 +42,7 @@ pip install mlx-lm fastapi uvicorn pydantic openai
 Example launch:
 
 ```bash
-TRANSLATEGEMMA_MLX_MODEL=mlx-community/translategemma-4b-it-4bit \
+TRANSLATEGEMMA_CONFIG_FILE=config.local.yaml \
 SRC_LANGUAGE_CODE=zh \
 DST_LANGUAGE_CODE=en \
 uvicorn server:app --host 127.0.0.1 --port 8088
@@ -59,7 +62,9 @@ uvicorn server:app --host 127.0.0.1 --port 8088
 
 ### Configuration file
 
-- Edit `config.yaml` to change defaults such as the model path, context limits, or default languages.
+- Edit `config.yaml` to change defaults such as the model map, context limits, or default languages.
+- Use `model_map` to map user-facing model names to local MLX paths.
+- Use `model_idle_timeout_seconds` to control when inactive models are unloaded.
 - Use `lang_alias` in `config.yaml` to map a canonical language code to a list of human-readable aliases (for example `zh: ["simplified chinese", "chinese"]`).
 - Use `TRANSLATEGEMMA_CONFIG_FILE=/path/to/custom.yaml` when launching `uvicorn` if you want to point the server at another YAML file.
 - Environment variables continue to take precedence over YAML values, so automation scripts and `start_*.sh` remain compatible.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import re
 import time
@@ -8,7 +9,7 @@ import asyncio
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from mlx_lm import load, generate
@@ -18,30 +19,138 @@ from config import AUTO_DETECT_SENTINEL, build_lang_label_map, load_config
 
 # ========= Configuration =========
 CONFIG = load_config()
-MODEL_PATH = CONFIG.model_path
+MODEL_REGISTRY = CONFIG.model_map
 MAX_CONTEXT_TOKENS = CONFIG.max_context_tokens
 DEFAULT_MAX_OUTPUT_TOKENS = CONFIG.default_max_output_tokens
 MIN_INPUT_BUDGET = CONFIG.min_input_budget  # Prevent the input budget from becoming too small in edge cases
 EXTRA_STOP_STRINGS = CONFIG.extra_stop_strings
+MODEL_IDLE_TIMEOUT_SECONDS = CONFIG.model_idle_timeout_seconds
 SRC_LANGUAGE_CODE = CONFIG.src_language_code
 DST_LANGUAGE_CODE = CONFIG.dst_language_code
 LANG_LABEL_MAP = build_lang_label_map(CONFIG.lang_alias)
 VERBOSE_LOGGING = CONFIG.verbose_logging
-print(MODEL_PATH)
-model, tokenizer = load(
-    MODEL_PATH,
-)
-for stop in EXTRA_STOP_STRINGS:
-    try:
-        tokenizer.add_eos_token(stop)
-    except ValueError:
-        # Some tokenizers may not expose that special token; ignore the error
-        pass
 
-app = FastAPI(title="TranslateGemma MLX OpenAI-Compatible Service", version="1.1.0")
+app = FastAPI(title="TranslateGemma MLX OpenAI-Compatible Service", version="1.2.0")
 
 # ========= Concurrency lock: at most one generate call at a time =========
 GEN_LOCK = asyncio.Lock()
+IDLE_CHECK_INTERVAL_SECONDS = 30
+
+MODEL_STATE: Dict[str, Any] = {
+    "name": None,
+    "path": None,
+    "model": None,
+    "tokenizer": None,
+    "last_used": 0.0,
+}
+
+class OpenAIHTTPException(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        code: str,
+        param: Optional[str] = None,
+        err_type: str = "invalid_request_error",
+    ) -> None:
+        self.status_code = status_code
+        self.message = message
+        self.code = code
+        self.param = param
+        self.err_type = err_type
+
+
+@app.exception_handler(OpenAIHTTPException)
+async def _openai_http_exception_handler(_: Request, exc: OpenAIHTTPException):
+    payload = {
+        "error": {
+            "message": exc.message,
+            "type": exc.err_type,
+            "param": exc.param,
+            "code": exc.code,
+        }
+    }
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+def _resolve_model_name(requested: Optional[str]) -> str:
+    if not requested:
+        raise OpenAIHTTPException(
+            status_code=400,
+            message="You must provide a model parameter.",
+            code="model_required",
+            param="model",
+        )
+    if requested not in MODEL_REGISTRY:
+        raise OpenAIHTTPException(
+            status_code=404,
+            message=f"The model '{requested}' does not exist.",
+            code="model_not_found",
+            param="model",
+        )
+    return requested
+
+
+def _load_model(path: str) -> Tuple[Any, Any]:
+    model, tokenizer = load(path)
+    for stop in EXTRA_STOP_STRINGS:
+        try:
+            tokenizer.add_eos_token(stop)
+        except ValueError:
+            # Some tokenizers may not expose that special token; ignore the error
+            pass
+    return model, tokenizer
+
+
+def _unload_model_locked(reason: str) -> None:
+    if MODEL_STATE["model"] is None:
+        return
+    if VERBOSE_LOGGING:
+        print(f"[TranslateGemma][DEBUG] unloading model={MODEL_STATE['name']} reason={reason}", flush=True)
+    MODEL_STATE["model"] = None
+    MODEL_STATE["tokenizer"] = None
+    MODEL_STATE["name"] = None
+    MODEL_STATE["path"] = None
+    MODEL_STATE["last_used"] = 0.0
+    gc.collect()
+
+
+def _ensure_model_loaded_locked(model_name: str) -> Tuple[Any, Any]:
+    if MODEL_STATE["model"] is not None and MODEL_STATE["name"] == model_name:
+        return MODEL_STATE["model"], MODEL_STATE["tokenizer"]
+
+    if MODEL_STATE["model"] is not None and MODEL_STATE["name"] != model_name:
+        _unload_model_locked("model_switch")
+
+    model_path = MODEL_REGISTRY[model_name]
+    if VERBOSE_LOGGING:
+        print(f"[TranslateGemma][DEBUG] loading model={model_name} path={model_path}", flush=True)
+    model, tokenizer = _load_model(model_path)
+    MODEL_STATE["model"] = model
+    MODEL_STATE["tokenizer"] = tokenizer
+    MODEL_STATE["name"] = model_name
+    MODEL_STATE["path"] = model_path
+    MODEL_STATE["last_used"] = time.time()
+    return model, tokenizer
+
+
+async def _idle_unload_loop() -> None:
+    if MODEL_IDLE_TIMEOUT_SECONDS <= 0:
+        return
+    while True:
+        await asyncio.sleep(IDLE_CHECK_INTERVAL_SECONDS)
+        async with GEN_LOCK:
+            if MODEL_STATE["model"] is None:
+                continue
+            idle_seconds = time.time() - float(MODEL_STATE["last_used"] or 0.0)
+            if idle_seconds >= MODEL_IDLE_TIMEOUT_SECONDS:
+                _unload_model_locked("idle_timeout")
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    if MODEL_IDLE_TIMEOUT_SECONDS > 0:
+        asyncio.create_task(_idle_unload_loop())
 
 
 # ========= OpenAI compatible schema =========
@@ -150,7 +259,7 @@ def decide_target_lang(text: str, requested_src: Optional[str], requested_dst: O
 
 
 # ========= Token counting =========
-def tok_len(s: str) -> int:
+def tok_len(tokenizer: Any, s: str) -> int:
     return len(tokenizer.encode(s))
 
 
@@ -176,16 +285,16 @@ def make_messages_structured(chunk_text: str, src: str, tgt: str) -> List[Dict[s
     }]
     return [{"role": "user", "content": content}]
 
-def build_prompt(chunk_text: str, src: str, tgt: str) -> str:
+def build_prompt(tokenizer: Any, chunk_text: str, src: str, tgt: str) -> str:
     messages = make_messages_structured(chunk_text, src, tgt)
     if getattr(tokenizer, "chat_template", None):
         return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     # Fallback (rarely hit)
     return f"Translate from {src} to {tgt}. Return only the translation.\n\n{chunk_text}"
 
-def chunk_text_to_fit(text: str, src: str, tgt: str, max_output_tokens: int) -> List[str]:
-    empty_prompt = build_prompt("", src, tgt)
-    overhead = tok_len(empty_prompt)
+def chunk_text_to_fit(tokenizer: Any, text: str, src: str, tgt: str, max_output_tokens: int) -> List[str]:
+    empty_prompt = build_prompt(tokenizer, "", src, tgt)
+    overhead = tok_len(tokenizer, empty_prompt)
     budget = MAX_CONTEXT_TOKENS - max_output_tokens - overhead
     if budget < MIN_INPUT_BUDGET:
         budget = MIN_INPUT_BUDGET
@@ -202,19 +311,19 @@ def chunk_text_to_fit(text: str, src: str, tgt: str, max_output_tokens: int) -> 
 
     for p in paras:
         cand = (cur + "\n\n" + p).strip() if cur else p
-        if tok_len(cand) <= budget:
+        if tok_len(tokenizer, cand) <= budget:
             cur = cand
             continue
 
         if cur:
             flush()
 
-        if tok_len(p) > budget:
+        if tok_len(tokenizer, p) > budget:
             sents = split_by_sentences(p)
             buf = ""
             for s in sents:
                 cand2 = (buf + " " + s).strip() if buf else s
-                if tok_len(cand2) <= budget:
+                if tok_len(tokenizer, cand2) <= budget:
                     buf = cand2
                 else:
                     if buf:
@@ -229,7 +338,7 @@ def chunk_text_to_fit(text: str, src: str, tgt: str, max_output_tokens: int) -> 
                             while lo <= hi:
                                 mid = (lo + hi) // 2
                                 piece = long[:mid]
-                                if tok_len(piece) <= budget:
+                                if tok_len(tokenizer, piece) <= budget:
                                     best = mid
                                     lo = mid + 1
                                 else:
@@ -249,9 +358,17 @@ def chunk_text_to_fit(text: str, src: str, tgt: str, max_output_tokens: int) -> 
 
 
 # ========= Translate a chunk + usage accounting =========
-def translate_chunk(chunk_text: str, src: str, tgt: str, max_output_tokens: int, temperature: float) -> Tuple[str, int, int]:
-    prompt = build_prompt(chunk_text, src, tgt)
-    prompt_tokens = tok_len(prompt)
+def translate_chunk(
+    model: Any,
+    tokenizer: Any,
+    chunk_text: str,
+    src: str,
+    tgt: str,
+    max_output_tokens: int,
+    temperature: float,
+) -> Tuple[str, int, int]:
+    prompt = build_prompt(tokenizer, chunk_text, src, tgt)
+    prompt_tokens = tok_len(tokenizer, prompt)
 
     sampler = make_sampler(temperature)
 
@@ -264,7 +381,7 @@ def translate_chunk(chunk_text: str, src: str, tgt: str, max_output_tokens: int,
         verbose=VERBOSE_LOGGING,
     ).strip()
 
-    completion_tokens = tok_len(out)
+    completion_tokens = tok_len(tokenizer, out)
     return out, prompt_tokens, completion_tokens
 
 
@@ -288,8 +405,43 @@ def _format_stream_event(base: Dict[str, Any], delta: Dict[str, str], finish_rea
 def health():
     return {
         "ok": True,
-        "model_path": MODEL_PATH,
+        "loaded_model": MODEL_STATE["name"],
+        "loaded_model_path": MODEL_STATE["path"],
         "max_context_tokens": MAX_CONTEXT_TOKENS,
+        "model_idle_timeout_seconds": MODEL_IDLE_TIMEOUT_SECONDS,
+    }
+
+
+@app.get("/v1/models")
+def list_models():
+    created = int(time.time())
+    data = []
+    for name in MODEL_REGISTRY:
+        data.append(
+            {
+                "id": name,
+                "object": "model",
+                "created": created,
+                "owned_by": "local",
+            }
+        )
+    return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_id}")
+def get_model(model_id: str):
+    if model_id not in MODEL_REGISTRY:
+        raise OpenAIHTTPException(
+            status_code=404,
+            message=f"The model '{model_id}' does not exist.",
+            code="model_not_found",
+            param="model",
+        )
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "local",
     }
 
 
@@ -333,16 +485,25 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request):
     if max_output_tokens >= MAX_CONTEXT_TOKENS:
         max_output_tokens = min(512, MAX_CONTEXT_TOKENS // 4)
 
-    chunks = chunk_text_to_fit(full_text, src, tgt, max_output_tokens=max_output_tokens)
-    if VERBOSE_LOGGING:
-        print(
-            f"[TranslateGemma][DEBUG] src={src} dst={tgt} chunks={len(chunks)} tokens={max_output_tokens}",
-            flush=True,
-        )
+    model_name = _resolve_model_name(req.model)
 
     # ====== Concurrency lock: serialize generate to avoid overlapping requests ======
     t0 = time.time()
     async with GEN_LOCK:
+        model, tokenizer = _ensure_model_loaded_locked(model_name)
+        MODEL_STATE["last_used"] = time.time()
+        chunks = chunk_text_to_fit(
+            tokenizer,
+            full_text,
+            src,
+            tgt,
+            max_output_tokens=max_output_tokens,
+        )
+        if VERBOSE_LOGGING:
+            print(
+                f"[TranslateGemma][DEBUG] model={model_name} src={src} dst={tgt} chunks={len(chunks)} tokens={max_output_tokens}",
+                flush=True,
+            )
         outputs: List[str] = []
         prompt_tokens_sum = 0
         completion_tokens_sum = 0
@@ -354,7 +515,11 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request):
                     flush=True,
                 )
             out, pt, ct = translate_chunk(
-                ch, src, tgt,
+                model,
+                tokenizer,
+                ch,
+                src,
+                tgt,
                 max_output_tokens=max_output_tokens,
                 temperature=req.temperature,
             )
@@ -368,7 +533,6 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request):
     if req.stream:
         response_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        model_name = req.model or MODEL_PATH
         chunk_size = 200
 
         def event_stream():
@@ -392,7 +556,7 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request):
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": req.model or MODEL_PATH,
+        "model": model_name,
         "choices": [
             {
                 "index": 0,
@@ -406,6 +570,8 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request):
             "total_tokens": prompt_tokens_sum + completion_tokens_sum,
         },
         "_meta": {
+            "model_name": model_name,
+            "model_path": MODEL_STATE["path"],
             "src_lang": src,
             "tgt_lang": tgt,
             "chunks": len(chunks),

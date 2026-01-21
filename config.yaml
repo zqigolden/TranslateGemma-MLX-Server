@@ -1,9 +1,11 @@
-model_path: mlx-community/translategemma-4b-it-4bit
+model_map:
+  translategemma-mlx: mlx-community/translategemma-4b-it-4bit
 max_context_tokens: 2048
 default_max_output_tokens: 512
 min_input_budget: 256
 extra_stop_strings:
   - "<end_of_turn>"
+model_idle_timeout_seconds: 600
 src_language_code: null
 dst_language_code: null
 lang_alias:
