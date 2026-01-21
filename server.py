@@ -8,6 +8,7 @@ import uuid
 import asyncio
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
+import langcodes
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -177,6 +178,7 @@ _LANG_DIRECTIVE_RE = re.compile(
 _LANG_DIRECTIVE_SINGLE_RE = re.compile(
     r"^\[(?P<inner>[^\]]+?)\]\s*",
 )
+_ISO_639_1_RE = re.compile(r"^[A-Za-z]{2}([_-][A-Za-z0-9]{2,8})*$")
 
 def _normalize_lang_code(value: Optional[str]) -> Optional[str]:
     if not value:
@@ -189,7 +191,18 @@ def _normalize_lang_code(value: Optional[str]) -> Optional[str]:
     if not alias_key or alias_key == AUTO_DETECT_SENTINEL:
         return None
     mapped = LANG_LABEL_MAP.get(alias_key)
-    return mapped if mapped is not None else raw
+    if mapped is not None:
+        return mapped
+    if _ISO_639_1_RE.fullmatch(raw):
+        return raw
+    try:
+        resolved = langcodes.Language.find(alias_key)
+    except Exception:
+        return raw
+    lang = resolved.language
+    if lang and len(lang) == 2:
+        return lang
+    return raw
 
 
 def _strip_language_suffix(value: str) -> str:

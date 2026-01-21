@@ -5,12 +5,12 @@ This repository exposes the TranslateGemma MLX model through an OpenAI-compatibl
 ## Requirements
 
 - Python 3.12 (Apple Silicon recommended for MLX)
-- Packages: `mlx_lm`, `fastapi`, `uvicorn`, `pydantic`, `openai`, `pyyaml`
+- Packages: `mlx_lm`, `fastapi`, `uvicorn`, `pydantic`, `openai`, `pyyaml`, `langcodes`
 
 Install them via:
 
 ```bash
-pip install mlx-lm fastapi uvicorn pydantic openai
+pip install mlx-lm fastapi uvicorn pydantic openai langcodes
 ```
 
 ## server.py
@@ -52,6 +52,7 @@ uvicorn server:app --host 127.0.0.1 --port 8088
 
 - Inline directive `[xx]->[yy]` (or the single-bracket form `[xx->yy]`) inside the user message has the highest priority; language labels may include spaces and ignore a trailing `language` suffix (e.g., `Japanese Language` == `Japanese`).
 - Request fields come next: set both `src_language_code` / `dst_language_code` to a concrete pair (e.g., `"en"` + `"zh"`) to force that direction. If you only set one, the request is rejected.
+- When a language label is not matched by `lang_alias` and is not already ISO 639-1 (including forms like `zh-CN` or `zh-Hans`), the server attempts to resolve it with `langcodes` (e.g., `French` → `fr`).
 - You can also prefix the user content with an inline directive such as `[zh]->[en]` followed by a space; the directive will be stripped and the specified source/target pair will be honored.
 - If neither directive nor request fields resolve the direction, the server falls back to `config.yaml` when `SRC_LANGUAGE_CODE`/`DST_LANGUAGE_CODE` are set; otherwise it uses CJK-based detection to pick between `zh` and `en`.
 - To trigger CJK detection, leave both language fields unset (or set them to `auto`); the server will choose between `zh` and `en`.
