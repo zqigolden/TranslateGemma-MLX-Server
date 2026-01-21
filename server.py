@@ -6,13 +6,13 @@ import re
 import time
 import uuid
 import asyncio
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from mlx_lm import load, generate
+from mlx_lm import load, generate, stream_generate
 from mlx_lm.sample_utils import make_sampler
 from config import AUTO_DETECT_SENTINEL, build_lang_label_map, load_config
 
@@ -385,6 +385,29 @@ def translate_chunk(
     return out, prompt_tokens, completion_tokens
 
 
+def translate_chunk_stream(
+    model: Any,
+    tokenizer: Any,
+    chunk_text: str,
+    src: str,
+    tgt: str,
+    max_output_tokens: int,
+    temperature: float,
+) -> Iterable[str]:
+    prompt = build_prompt(tokenizer, chunk_text, src, tgt)
+    sampler = make_sampler(temperature)
+
+    for response in stream_generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=max_output_tokens,
+        sampler=sampler,
+    ):
+        if response.text:
+            yield response.text
+
+
 def _split_stream_text(text: str, chunk_size: int) -> List[str]:
     if not text:
         return []
@@ -487,6 +510,57 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request):
 
     model_name = _resolve_model_name(req.model)
 
+    if req.stream:
+        response_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+
+        async def event_stream():
+            base = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+            }
+            yield _format_stream_event(base, {"role": "assistant"}, None)
+            async with GEN_LOCK:
+                model, tokenizer = _ensure_model_loaded_locked(model_name)
+                MODEL_STATE["last_used"] = time.time()
+                chunks = chunk_text_to_fit(
+                    tokenizer,
+                    full_text,
+                    src,
+                    tgt,
+                    max_output_tokens=max_output_tokens,
+                )
+                if VERBOSE_LOGGING:
+                    print(
+                        f"[TranslateGemma][DEBUG] model={model_name} src={src} dst={tgt} chunks={len(chunks)} tokens={max_output_tokens}",
+                        flush=True,
+                    )
+                for idx, ch in enumerate(chunks, start=1):
+                    if VERBOSE_LOGGING:
+                        print(
+                            f"[TranslateGemma][DEBUG] Translating chunk {idx}/{len(chunks)} chars={len(ch)}",
+                            flush=True,
+                        )
+                    for token in translate_chunk_stream(
+                        model,
+                        tokenizer,
+                        ch,
+                        src,
+                        tgt,
+                        max_output_tokens=max_output_tokens,
+                        temperature=req.temperature,
+                    ):
+                        if token:
+                            yield _format_stream_event(base, {"content": token}, None)
+                    if idx < len(chunks):
+                        yield _format_stream_event(base, {"content": "\n\n"}, None)
+            yield _format_stream_event(base, {}, "stop")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
     # ====== Concurrency lock: serialize generate to avoid overlapping requests ======
     t0 = time.time()
     async with GEN_LOCK:
@@ -529,27 +603,6 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request):
 
     translated = "\n\n".join(outputs).strip()
     latency_ms = int((time.time() - t0) * 1000)
-
-    if req.stream:
-        response_id = f"chatcmpl-{uuid.uuid4().hex}"
-        created = int(time.time())
-        chunk_size = 200
-
-        def event_stream():
-            base = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-            }
-            yield _format_stream_event(base, {"role": "assistant"}, None)
-            for piece in _split_stream_text(translated, chunk_size):
-                if piece:
-                    yield _format_stream_event(base, {"content": piece}, None)
-            yield _format_stream_event(base, {}, "stop")
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     # OpenAI compatible response + estimated usage
     return {

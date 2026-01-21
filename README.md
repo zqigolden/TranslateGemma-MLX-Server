@@ -25,7 +25,7 @@ pip install mlx-lm fastapi uvicorn pydantic openai
 - Accepts optional `src_language_code` / `dst_language_code` request fields (omit both to rely on config defaults) or inline directives like `[zh]->[en]` to override language detection.
 - Honors the `TRANSLATEGEMMA_VERBOSE` environment variable so you can enable/disable chunk debug logs and `mlx_lm.generate(..., verbose=True)` without changing API requests.
 - Reads configuration defaults from `config.yaml` via `config.py` (PyYAML + Pydantic); environment variables can override individual values.
-- Supports `stream=true` via pseudo-streaming (chunks are sent after full generation, not token-by-token).
+- Supports `stream=true` with token streaming via `mlx_lm.stream_generate`.
 
 ### Configuration
 
@@ -58,7 +58,7 @@ uvicorn server:app --host 127.0.0.1 --port 8088
 
 ### Debug logging
 
-- Set the `TRANSLATEGEMMA_VERBOSE` environment variable when starting the server (e.g., `TRANSLATEGEMMA_VERBOSE=1 bash start_4b.sh`) to stream chunk diagnostics to stdout and pass `verbose=True` into `mlx_lm.generate`.
+- Set the `TRANSLATEGEMMA_VERBOSE` environment variable when starting the server (e.g., `TRANSLATEGEMMA_VERBOSE=1 bash start_4b.sh`) to stream chunk diagnostics to stdout. Non-streaming requests also pass `verbose=True` into `mlx_lm.generate`; streaming uses `mlx_lm.stream_generate` and does not emit verbose token logs.
 
 ### Configuration file
 
